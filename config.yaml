@@ -1,0 +1,50 @@
+camera:
+  index: 2
+
+models:
+  person: yolov8n.pt
+  face:
+    score_threshold: 0.6
+  pose: yolov8n-pose.pt
+
+rois:
+  safe:
+    x1: 80
+    y1: 60
+    x2: 560
+    y2: 420
+  climb_rails:
+    # 침대 난간 띠. 실행 중 'c' 키로 추가(최대 4개), 'x' 키로 전체 초기화.
+    - {x1: 80, y1: 40, x2: 560, y2: 80}
+
+heuristics:
+  suffocation:
+    min_duration_s: 5.0
+    keypoint_conf_threshold: 0.5
+    flipped_min_visible: 3     # 4개(양쪽 어깨·엉덩이) 중 N 이상 보이면 flipped
+    blanket_max_visible: 0     # 이 이하면 blanket
+  climbing:
+    min_duration_s: 2.0
+    wrist_conf_threshold: 0.5
+    standing_y_margin: 20      # hip_y - shoulder_y ≥ (px)
+  roi_exit:
+    min_duration_s: 0.0        # 즉시 판정, grace로 튐 완화
+  fall:
+    min_duration_s: 0.3        # 낙상은 순간적이므로 짧게
+    min_velocity_px_s: 200     # 하강 속도 임계값 (px/s)
+
+stability:
+  grace_s: 0.5
+  ema_alpha: 0.4
+
+dispatcher:
+  cooldown_s: 30.0
+
+audio:
+  sample_rate: 16000
+  chunk_duration_s: 0.96          # YAMNet 입력 단위 (초)
+  window_chunks: 3                 # 슬라이딩 윈도우 크기 (~2.9초)
+  score_threshold: 0.3             # cry_active=True 임계값
+  min_duration_s: 1.0              # cry_tracker 판정까지 최소 지속 시간
+  whimper_score_threshold: 0.25    # whimper_active=True 임계값 (cry보다 낮게)
+  whimper_min_duration_s: 2.0     # whimper_tracker 판정까지 최소 지속 시간

@@ -1,0 +1,18 @@
+# Week 1~2 필수
+ultralytics==8.4.41
+opencv-python==4.13.0.92
+PyYAML==6.0.3
+
+# Week 3 (음성)
+tensorflow==2.21.0
+tensorflow-hub==0.16.1
+sounddevice==0.5.5
+soundfile==0.13.1
+
+# Week 4 (서버 연동)
+requests==2.33.1
+fastapi==0.136.0
+uvicorn==0.45.0
+
+# 테스트
+pytest==8.4.1

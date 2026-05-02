@@ -1,0 +1,326 @@
+"""v1: pose + 두 개 ROI + cause 분기 질식 + 안정화 레이어.
+
+실행: python main.py
+키:
+  q  종료
+  r  safe_roi 재선택
+  c  climb_rail ROI 추가 (최대 4개)
+  x  climb_rail ROI 전체 초기화
+"""
+from pathlib import Path
+from time import time
+
+import cv2
+import yaml
+
+from vision.face import FaceDetector
+from vision.heuristics import (
+    RiskSignal,
+    evaluate_climbing,
+    evaluate_fall,
+    evaluate_roi_exit,
+    evaluate_suffocation,
+    main_person,
+)
+from vision.person import PersonDetector
+from vision.pose import KP_NAMES, PoseDetector, match_pose_to_person
+from vision.smoothing import EMA
+from vision.tracker import DurationTracker
+from audio.yamnet_classifier import AudioClassifier
+
+CONFIG_PATH = Path(__file__).parent / "config.yaml"
+
+KP_EDGES = [
+    ("left_shoulder", "right_shoulder"),
+    ("left_shoulder", "left_hip"),
+    ("right_shoulder", "right_hip"),
+    ("left_hip", "right_hip"),
+    ("left_shoulder", "left_elbow"),
+    ("left_elbow", "left_wrist"),
+    ("right_shoulder", "right_elbow"),
+    ("right_elbow", "right_wrist"),
+    ("left_hip", "left_knee"),
+    ("left_knee", "left_ankle"),
+    ("right_hip", "right_knee"),
+    ("right_knee", "right_ankle"),
+]
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def select_roi_interactive(window: str, frame) -> tuple[int, int, int, int] | None:
+    sel = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
+    if sel[2] <= 0 or sel[3] <= 0:
+        return None
+    x, y, w, h = sel
+    return (int(x), int(y), int(x + w), int(y + h))
+
+
+def clamp_roi(roi, w, h):
+    x1, y1, x2, y2 = roi
+    return (max(0, min(x1, w - 1)), max(0, min(y1, h - 1)),
+            max(0, min(x2, w - 1)), max(0, min(y2, h - 1)))
+
+
+def compute_wrist(pose, conf_threshold):
+    if pose is None:
+        return None
+    wrists = [pose.keypoints[k] for k in ("left_wrist", "right_wrist")
+              if pose.keypoints[k][2] >= conf_threshold]
+    if not wrists:
+        return None
+    cx = sum(w[0] for w in wrists) / len(wrists)
+    cy = sum(w[1] for w in wrists) / len(wrists)
+    return (cx, cy)
+
+
+def draw_pose(frame, pose, conf_threshold):
+    if pose is None:
+        return
+    kp = pose.keypoints
+    for name in KP_NAMES:
+        x, y, c = kp[name]
+        if c >= conf_threshold:
+            cv2.circle(frame, (int(x), int(y)), 3, (255, 0, 0), -1)
+    for a, b in KP_EDGES:
+        xa, ya, ca = kp[a]
+        xb, yb, cb = kp[b]
+        if ca >= conf_threshold and cb >= conf_threshold:
+            cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), (255, 0, 0), 1)
+
+
+def draw_overlay(frame, persons, faces, main_pose, safe_roi, climb_rois, active_risks, debug, kp_conf):
+    cv2.rectangle(frame, (safe_roi[0], safe_roi[1]), (safe_roi[2], safe_roi[3]), (100, 100, 255), 1)
+    cv2.putText(frame, "safe", (safe_roi[0] + 4, safe_roi[1] + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 1)
+    for i, roi in enumerate(climb_rois):
+        cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (0, 150, 255), 1)
+        cv2.putText(frame, f"rail{i}", (roi[0] + 4, roi[1] + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 255), 1)
+    for p in persons:
+        x1, y1, x2, y2 = map(int, p.bbox)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"person {p.confidence:.2f}", (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    for f in faces:
+        x1, y1, x2, y2 = map(int, f.bbox)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        cv2.putText(frame, f"face {f.confidence:.2f}", (x1, max(0, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    draw_pose(frame, main_pose, kp_conf)
+    y = 18
+    for k, v in debug.items():
+        cv2.putText(frame, f"{k}: {v}", (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y += 16
+    for i, sig in enumerate(active_risks):
+        cause = sig.metadata.get("cause")
+        zone = sig.metadata.get("zone")
+        tag = cause or zone or ""
+        label = f"[{sig.type}/{tag}]" if tag else f"[{sig.type}]"
+        cv2.putText(frame, f"{label}", (10, y + 10 + i * 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+
+def main() -> None:
+    cfg = load_config()
+    cam = cv2.VideoCapture(cfg["camera"]["index"])
+    if not cam.isOpened():
+        raise RuntimeError("웹캠을 열 수 없습니다")
+
+    person_det = PersonDetector(cfg["models"]["person"])
+    face_det = FaceDetector(cfg["models"]["face"]["score_threshold"])
+    pose_det = PoseDetector(cfg["models"]["pose"])
+
+    suf_cfg = cfg["heuristics"]["suffocation"]
+    clm_cfg = cfg["heuristics"]["climbing"]
+    exit_cfg = cfg["heuristics"]["roi_exit"]
+    fall_cfg = cfg["heuristics"]["fall"]
+    stab_cfg = cfg["stability"]
+
+    aud_cfg = cfg["audio"]
+    audio = AudioClassifier(aud_cfg)
+    audio_on = audio.start()
+
+    cry_tracker = DurationTracker(aud_cfg["min_duration_s"], stab_cfg["grace_s"])
+    whimper_tracker = DurationTracker(aud_cfg["whimper_min_duration_s"], stab_cfg["grace_s"])
+
+    safe_roi = (cfg["rois"]["safe"]["x1"], cfg["rois"]["safe"]["y1"],
+                cfg["rois"]["safe"]["x2"], cfg["rois"]["safe"]["y2"])
+    climb_rois: list[tuple[int, int, int, int]] = [
+        (r["x1"], r["y1"], r["x2"], r["y2"]) for r in cfg["rois"]["climb_rails"]
+    ]
+
+    center_ema = EMA(stab_cfg["ema_alpha"])
+    wrist_ema = EMA(stab_cfg["ema_alpha"])
+
+    suf_tracker = DurationTracker(suf_cfg["min_duration_s"], stab_cfg["grace_s"])
+    clm_tracker = DurationTracker(clm_cfg["min_duration_s"], stab_cfg["grace_s"])
+    exit_tracker = DurationTracker(exit_cfg["min_duration_s"], stab_cfg["grace_s"])
+    fall_tracker = DurationTracker(fall_cfg["min_duration_s"], stab_cfg["grace_s"])
+
+    cooldown_s = cfg["dispatcher"]["cooldown_s"]
+    last_event_ts: dict[str, float] = {}
+
+    prev_center_xy: tuple[float, float] | None = None
+    prev_frame_time: float = 0.0
+
+    window = "infant-safety-v1"
+    clamped_once = False
+    try:
+        while True:
+            ok, frame = cam.read()
+            if not ok:
+                break
+            h, w = frame.shape[:2]
+            if not clamped_once:
+                safe_roi = clamp_roi(safe_roi, w, h)
+                climb_rois = [clamp_roi(r, w, h) for r in climb_rois]
+                clamped_once = True
+            now = time()
+
+            persons = person_det.detect(frame)
+            faces = face_det.detect(frame)
+            poses = pose_det.detect(frame)
+            p = main_person(persons)
+            main_pose = match_pose_to_person(p, poses) if p else None
+
+            center_xy = None
+            wrist_xy = None
+            if p is not None:
+                cx = (p.bbox[0] + p.bbox[2]) / 2
+                cy = (p.bbox[1] + p.bbox[3]) / 2
+                center_xy = center_ema.update(cx, cy)
+                wrist_pos = compute_wrist(main_pose, clm_cfg["wrist_conf_threshold"])
+                if wrist_pos is not None:
+                    wrist_xy = wrist_ema.update(*wrist_pos)
+            else:
+                center_ema.reset()
+                wrist_ema.reset()
+
+            suf_active, cause, suf_diag = evaluate_suffocation(
+                p, faces, main_pose,
+                suf_cfg["keypoint_conf_threshold"],
+                suf_cfg["flipped_min_visible"],
+                suf_cfg["blanket_max_visible"],
+            )
+            clm_active, clm_diag = evaluate_climbing(
+                wrist_xy, main_pose, climb_rois,
+                clm_cfg["wrist_conf_threshold"], clm_cfg["standing_y_margin"],
+            )
+            exit_active, exit_diag = evaluate_roi_exit(center_xy, safe_roi)
+            fall_active, fall_diag = evaluate_fall(
+                center_xy, prev_center_xy,
+                now - prev_frame_time if prev_frame_time else 0.0,
+                fall_cfg["min_velocity_px_s"],
+            )
+
+            cry_raw, cry_score, whimper_raw, whimper_score = (
+                audio.get_state() if audio_on else (False, 0.0, False, 0.0)
+            )
+            cry_condition = cry_raw and p is not None
+            whimper_condition = whimper_raw and p is not None
+
+            active_risks: list[RiskSignal] = []
+            if suf_tracker.update(suf_active, now):
+                active_risks.append(RiskSignal(
+                    "suffocation_risk",
+                    p.confidence if p else 0.0,
+                    {"cause": cause, "duration_s": round(suf_tracker.elapsed(now), 1),
+                     "heuristic": "face_not_in_person", **suf_diag},
+                ))
+            if clm_tracker.update(clm_active, now):
+                active_risks.append(RiskSignal(
+                    "climbing_risk",
+                    p.confidence if p else 0.0,
+                    {"zone": "crib_rail", "duration_s": round(clm_tracker.elapsed(now), 1),
+                     "heuristic": "wrist_in_rail_and_standing", **clm_diag},
+                ))
+            if exit_tracker.update(exit_active, now):
+                active_risks.append(RiskSignal(
+                    "roi_exit_risk",
+                    p.confidence if p else 0.0,
+                    {"duration_s": round(exit_tracker.elapsed(now), 1),
+                     "heuristic": "person_center_outside_roi", **exit_diag},
+                ))
+            if fall_tracker.update(fall_active, now):
+                active_risks.append(RiskSignal(
+                    "fall_risk",
+                    p.confidence if p else 0.0,
+                    {"duration_s": round(fall_tracker.elapsed(now), 1),
+                     "heuristic": "rapid_y_descent", **fall_diag},
+                ))
+            if cry_tracker.update(cry_condition, now):
+                active_risks.append(RiskSignal(
+                    "cry_detected",
+                    cry_score,
+                    {"duration_s": round(cry_tracker.elapsed(now), 1),
+                     "heuristic": "yamnet_cry_and_person_present"},
+                ))
+            if whimper_tracker.update(whimper_condition, now):
+                active_risks.append(RiskSignal(
+                    "babble_detected",
+                    whimper_score,
+                    {"duration_s": round(whimper_tracker.elapsed(now), 1),
+                     "heuristic": "yamnet_babbling_and_person_present"},
+                ))
+
+            for s in active_risks:
+                if now - last_event_ts.get(s.type, 0) >= cooldown_s:
+                    print(f"[EVENT] {s.type} conf={s.confidence:.2f} {s.metadata}")
+                    last_event_ts[s.type] = now
+
+            debug = {
+                "persons": len(persons),
+                "faces": len(faces),
+                "face_in_p": suf_diag.get("face_in_p", "-"),
+                "visible_kp": suf_diag.get("visible_keypoints", "-"),
+                "cause": cause or "-",
+                "suf_elapsed": f"{suf_tracker.elapsed(now):.1f}s",
+                "clm_elapsed": f"{clm_tracker.elapsed(now):.1f}s",
+                "wrist_ema": tuple(round(x) for x in wrist_xy) if wrist_xy else "-",
+                "center_ema": tuple(round(x) for x in center_xy) if center_xy else "-",
+                "roi_exit": exit_active,
+                "fall_v": fall_diag.get("fall_velocity", "-"),
+                "fall_elapsed": f"{fall_tracker.elapsed(now):.1f}s",
+                "cry_score": f"{cry_score:.2f}" if audio_on else "off",
+                "cry_elapsed": f"{cry_tracker.elapsed(now):.1f}s",
+                "babble_score": f"{whimper_score:.2f}" if audio_on else "off",
+                "babble_elapsed": f"{whimper_tracker.elapsed(now):.1f}s",
+            }
+            prev_center_xy = center_xy
+            prev_frame_time = now
+
+            draw_overlay(frame, persons, faces, main_pose, safe_roi, climb_rois,
+                         active_risks, debug, suf_cfg["keypoint_conf_threshold"])
+            cv2.imshow(window, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if key == ord("r"):
+                new_roi = select_roi_interactive(window, frame)
+                if new_roi is not None:
+                    safe_roi = clamp_roi(new_roi, w, h)
+                    print(f"[ROI] safe 업데이트: {safe_roi}")
+            if key == ord("c"):
+                if len(climb_rois) >= 4:
+                    print("[ROI] 최대 4개. x키로 전체 초기화 후 재추가 가능")
+                else:
+                    new_roi = select_roi_interactive(window, frame)
+                    if new_roi is not None:
+                        climb_rois.append(clamp_roi(new_roi, w, h))
+                        print(f"[ROI] climb_rail 추가 ({len(climb_rois)}개): {climb_rois[-1]}")
+            if key == ord("x"):
+                climb_rois.clear()
+                print("[ROI] climb_rail 전체 초기화")
+    finally:
+        audio.stop()
+        cam.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
