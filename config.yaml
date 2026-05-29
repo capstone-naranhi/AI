@@ -33,8 +33,8 @@ heuristics:
   roi_exit:
     min_duration_s: 0.0        # 즉시 판정, grace로 튐 완화
   fall:
-    min_duration_s: 0.3        # 낙상은 순간적이므로 짧게
-    min_velocity_px_s: 200     # 하강 속도 임계값 (px/s)
+    window_s: 0.3              # 이 시간 동안의 순 하강 거리를 본다 (단일 프레임 속도 X)
+    min_drop_px: 120           # 윈도우 내 하강이 이만큼(px) 이상이면 낙상
 
 stability:
   grace_s: 0.5
