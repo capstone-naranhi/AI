@@ -5,6 +5,7 @@
   q  종료
   r  ROI(가상 면) 재정의 (네 꼭짓점 다시 클릭)
 """
+from collections import deque
 from pathlib import Path
 from time import time
 
@@ -227,7 +228,7 @@ def main() -> None:
     suf_tracker = DurationTracker(suf_cfg["min_duration_s"], stab_cfg["grace_s"])
     clm_tracker = DurationTracker(clm_cfg["min_duration_s"], stab_cfg["grace_s"])
     exit_tracker = DurationTracker(exit_cfg["min_duration_s"], stab_cfg["grace_s"])
-    fall_tracker = DurationTracker(fall_cfg["min_duration_s"], stab_cfg["grace_s"])
+    fall_tracker = DurationTracker(0.0, 0.0)  # 윈도우가 시간 통합을 하므로 즉시 판정
 
     face_memory_s: float = suf_cfg.get("face_memory_s", 30.0)
 
@@ -235,8 +236,8 @@ def main() -> None:
 
     last_face_seen_time: float = 0.0
     person_was_in_roi: bool = False
-    prev_raw_center_xy: tuple[float, float] | None = None
-    prev_frame_time: float = 0.0
+    fall_window_s: float = fall_cfg["window_s"]
+    fall_center_hist: deque = deque()  # (t, (cx, cy)) — 낙상 윈도우
 
     clamped_once = False
     try:
@@ -285,10 +286,16 @@ def main() -> None:
                 clm_cfg["wrist_conf_threshold"], clm_cfg["standing_y_margin"],
             )
             exit_active, exit_diag = evaluate_roi_exit(center_xy, safe_polygon)
+
+            if raw_center_xy is not None:
+                fall_center_hist.append((now, raw_center_xy))
+                while len(fall_center_hist) > 1 and now - fall_center_hist[0][0] > fall_window_s:
+                    fall_center_hist.popleft()
+            else:
+                fall_center_hist.clear()
+            past_center_xy = fall_center_hist[0][1] if fall_center_hist else None
             fall_active, fall_diag = evaluate_fall(
-                raw_center_xy, prev_raw_center_xy,
-                now - prev_frame_time if prev_frame_time else 0.0,
-                fall_cfg["min_velocity_px_s"],
+                raw_center_xy, past_center_xy, fall_cfg["min_drop_px"],
             )
 
             cry_raw, cry_score, whimper_raw, whimper_score = (
@@ -353,8 +360,7 @@ def main() -> None:
                 "wrist_ema": tuple(round(x) for x in wrist_xy) if wrist_xy else "-",
                 "center_ema": tuple(round(x) for x in center_xy) if center_xy else "-",
                 "roi_exit": exit_active,
-                "fall_v": fall_diag.get("fall_velocity", "-"),
-                "fall_elapsed": f"{fall_tracker.elapsed(now):.1f}s",
+                "fall_drop": fall_diag.get("fall_drop", "-"),
                 "cry_score": f"{cry_score:.2f}" if audio_on else "off",
                 "cry_elapsed": f"{cry_tracker.elapsed(now):.1f}s",
                 "babble_score": f"{whimper_score:.2f}" if audio_on else "off",
@@ -362,8 +368,6 @@ def main() -> None:
             }
             if p is not None:
                 person_was_in_roi = not exit_active
-            prev_raw_center_xy = raw_center_xy
-            prev_frame_time = now
 
             draw_overlay(frame, persons, faces, main_pose, safe_polygon,
                          active_risks, debug, clm_cfg["wrist_conf_threshold"])
