@@ -3,14 +3,13 @@
 실행: python main.py
 키:
   q  종료
-  r  safe_roi 재선택
-  c  climb_rail ROI 추가 (최대 4개)
-  x  climb_rail ROI 전체 초기화
+  r  ROI(가상 면) 재정의 (네 꼭짓점 다시 클릭)
 """
 from pathlib import Path
 from time import time
 
 import cv2
+import numpy as np
 import yaml
 
 from vision.face import FaceDetector
@@ -20,6 +19,7 @@ from vision.heuristics import (
     evaluate_fall,
     evaluate_roi_exit,
     evaluate_suffocation,
+    face_inside_person,
     main_person,
 )
 from vision.person import PersonDetector
@@ -27,8 +27,15 @@ from vision.pose import KP_NAMES, PoseDetector, match_pose_to_person
 from vision.smoothing import EMA
 from vision.tracker import DurationTracker
 from audio.yamnet_classifier import AudioClassifier
+from events.edge import transition
+from events.mqtt_client import MqttPublisher
+from events.payload import build_payload
+from vision.quad_detector import ArucoQuadDetector, ContourQuadDetector
+from vision.manual_roi import load_polygon, save_polygon, select_polygon
+from vision.roi_geometry import average_quads
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
+ROI_PATH = Path(__file__).parent / "saved_roi.json"
 
 KP_EDGES = [
     ("left_shoulder", "right_shoulder"),
@@ -49,20 +56,6 @@ KP_EDGES = [
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
-
-
-def select_roi_interactive(window: str, frame) -> tuple[int, int, int, int] | None:
-    sel = cv2.selectROI(window, frame, showCrosshair=True, fromCenter=False)
-    if sel[2] <= 0 or sel[3] <= 0:
-        return None
-    x, y, w, h = sel
-    return (int(x), int(y), int(x + w), int(y + h))
-
-
-def clamp_roi(roi, w, h):
-    x1, y1, x2, y2 = roi
-    return (max(0, min(x1, w - 1)), max(0, min(y1, h - 1)),
-            max(0, min(x2, w - 1)), max(0, min(y2, h - 1)))
 
 
 def compute_wrist(pose, conf_threshold):
@@ -92,14 +85,11 @@ def draw_pose(frame, pose, conf_threshold):
             cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), (255, 0, 0), 1)
 
 
-def draw_overlay(frame, persons, faces, main_pose, safe_roi, climb_rois, active_risks, debug, kp_conf):
-    cv2.rectangle(frame, (safe_roi[0], safe_roi[1]), (safe_roi[2], safe_roi[3]), (100, 100, 255), 1)
-    cv2.putText(frame, "safe", (safe_roi[0] + 4, safe_roi[1] + 14),
+def draw_overlay(frame, persons, faces, main_pose, safe_polygon, active_risks, debug, kp_conf):
+    pts = np.array(safe_polygon, np.int32)
+    cv2.polylines(frame, [pts], True, (100, 100, 255), 2)
+    cv2.putText(frame, "safe", (safe_polygon[0][0] + 4, safe_polygon[0][1] + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 255), 1)
-    for i, roi in enumerate(climb_rois):
-        cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (0, 150, 255), 1)
-        cv2.putText(frame, f"rail{i}", (roi[0] + 4, roi[1] + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 255), 1)
     for p in persons:
         x1, y1, x2, y2 = map(int, p.bbox)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -125,6 +115,80 @@ def draw_overlay(frame, persons, faces, main_pose, safe_roi, climb_rois, active_
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
 
+def detect_safe_polygon(cam, cfg: dict, window: str):
+    """시작 시 N프레임 검출 → 꼭짓점 평균으로 안정 폴리곤 반환.
+
+    검출 실패 또는 비활성화 시 None. 호출자가 fallback_polygon으로 폴백.
+    """
+    auto_cfg = cfg.get("auto_roi", {})
+    if not auto_cfg.get("enabled", False):
+        return None
+    det_name = auto_cfg.get("detector", "contour")
+    if det_name == "aruco":
+        detector = ArucoQuadDetector(auto_cfg.get("aruco", {}).get("dict", "DICT_4X4_50"))
+        print("[AUTO-ROI] safe zone 검출 중... 마커 4개가 화면에 보이도록 맞춰주세요 (q=폴백)")
+    elif det_name == "contour":
+        c = auto_cfg["contour"]
+        detector = ContourQuadDetector(
+            c["canny_low"], c["canny_high"], c["min_area_ratio"], c["approx_eps_ratio"],
+        )
+        print("[AUTO-ROI] safe zone 검출 중... (배경 깔끔하게, 박스 전체가 보이도록)")
+    else:
+        print(f"[AUTO-ROI] detector '{det_name}' 미구현. 폴백.")
+        return None
+    quads = []
+    target = int(auto_cfg["init_frames"])
+    max_tries = target * 10
+    tries = 0
+    while len(quads) < target and tries < max_tries:
+        tries += 1
+        ok, frame = cam.read()
+        if not ok:
+            continue
+        quad = detector.detect_quad(frame)
+        if quad is not None:
+            quads.append(quad)
+            cv2.polylines(frame, [np.array(quad, np.int32)], True, (0, 255, 0), 2)
+        cv2.putText(frame, f"Detecting safe zone... ({len(quads)}/{target})",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.imshow(window, frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+    poly = average_quads(quads)
+    if poly is None:
+        print(f"[AUTO-ROI] 검출 실패 ({len(quads)}/{target}). fallback_polygon 사용.")
+        return None
+    poly = [(int(round(x)), int(round(y))) for x, y in poly]
+    print(f"[AUTO-ROI] safe polygon = {poly} ({len(quads)}/{target} hits)")
+    return poly
+
+
+def setup_roi(cam, cfg: dict, window: str):
+    """detector 설정에 따라 safe polygon 결정. 실패 시 fallback_polygon.
+
+    manual: 저장본 있으면 재사용, 없으면 클릭 선택 후 저장.
+    aruco/contour: detect_safe_polygon으로 N프레임 자동 검출.
+    """
+    auto_cfg = cfg["auto_roi"]
+    det_name = auto_cfg.get("detector", "manual")
+    poly = None
+    if det_name == "manual":
+        poly = load_polygon(ROI_PATH)
+        if poly is not None:
+            print(f"[ROI] 저장된 ROI 사용: {poly}  (재정의: r 키)")
+        else:
+            poly = select_polygon(cam, window)
+            if poly is not None:
+                save_polygon(ROI_PATH, poly)
+                print(f"[ROI] 저장: {ROI_PATH}")
+    else:
+        poly = detect_safe_polygon(cam, cfg, window)
+    if poly is None:
+        print("[ROI] fallback_polygon 사용.")
+        poly = [tuple(pt) for pt in auto_cfg["fallback_polygon"]]
+    return poly
+
+
 def main() -> None:
     cfg = load_config()
     cam = cv2.VideoCapture(cfg["camera"]["index"])
@@ -145,14 +209,17 @@ def main() -> None:
     audio = AudioClassifier(aud_cfg)
     audio_on = audio.start()
 
+    mqtt_cfg = cfg["mqtt"]
+    publisher = MqttPublisher(mqtt_cfg["host"], mqtt_cfg["port"], mqtt_cfg["topic"])
+    publisher.start()
+    device_serial = mqtt_cfg["device_serial"]
+
     cry_tracker = DurationTracker(aud_cfg["min_duration_s"], stab_cfg["grace_s"])
     whimper_tracker = DurationTracker(aud_cfg["whimper_min_duration_s"], stab_cfg["grace_s"])
 
-    safe_roi = (cfg["rois"]["safe"]["x1"], cfg["rois"]["safe"]["y1"],
-                cfg["rois"]["safe"]["x2"], cfg["rois"]["safe"]["y2"])
-    climb_rois: list[tuple[int, int, int, int]] = [
-        (r["x1"], r["y1"], r["x2"], r["y2"]) for r in cfg["rois"]["climb_rails"]
-    ]
+    window = "infant-safety-v1"
+    safe_polygon = setup_roi(cam, cfg, window)
+    rail_band_px = cfg["auto_roi"]["rail_band_px"]
 
     center_ema = EMA(stab_cfg["ema_alpha"])
     wrist_ema = EMA(stab_cfg["ema_alpha"])
@@ -162,13 +229,15 @@ def main() -> None:
     exit_tracker = DurationTracker(exit_cfg["min_duration_s"], stab_cfg["grace_s"])
     fall_tracker = DurationTracker(fall_cfg["min_duration_s"], stab_cfg["grace_s"])
 
-    cooldown_s = cfg["dispatcher"]["cooldown_s"]
-    last_event_ts: dict[str, float] = {}
+    face_memory_s: float = suf_cfg.get("face_memory_s", 30.0)
 
-    prev_center_xy: tuple[float, float] | None = None
+    event_states: dict = {}
+
+    last_face_seen_time: float = 0.0
+    person_was_in_roi: bool = False
+    prev_raw_center_xy: tuple[float, float] | None = None
     prev_frame_time: float = 0.0
 
-    window = "infant-safety-v1"
     clamped_once = False
     try:
         while True:
@@ -177,8 +246,8 @@ def main() -> None:
                 break
             h, w = frame.shape[:2]
             if not clamped_once:
-                safe_roi = clamp_roi(safe_roi, w, h)
-                climb_rois = [clamp_roi(r, w, h) for r in climb_rois]
+                safe_polygon = [(max(0, min(x, w - 1)), max(0, min(y, h - 1)))
+                                for x, y in safe_polygon]
                 clamped_once = True
             now = time()
 
@@ -188,11 +257,13 @@ def main() -> None:
             p = main_person(persons)
             main_pose = match_pose_to_person(p, poses) if p else None
 
+            raw_center_xy = None
             center_xy = None
             wrist_xy = None
             if p is not None:
                 cx = (p.bbox[0] + p.bbox[2]) / 2
                 cy = (p.bbox[1] + p.bbox[3]) / 2
+                raw_center_xy = (cx, cy)
                 center_xy = center_ema.update(cx, cy)
                 wrist_pos = compute_wrist(main_pose, clm_cfg["wrist_conf_threshold"])
                 if wrist_pos is not None:
@@ -201,19 +272,21 @@ def main() -> None:
                 center_ema.reset()
                 wrist_ema.reset()
 
+            if p is not None and any(face_inside_person(f, p) for f in faces):
+                last_face_seen_time = now
+            face_recently_seen = (last_face_seen_time > 0
+                                  and (now - last_face_seen_time) < face_memory_s)
+
             suf_active, cause, suf_diag = evaluate_suffocation(
-                p, faces, main_pose,
-                suf_cfg["keypoint_conf_threshold"],
-                suf_cfg["flipped_min_visible"],
-                suf_cfg["blanket_max_visible"],
+                p, faces, face_recently_seen, person_was_in_roi,
             )
             clm_active, clm_diag = evaluate_climbing(
-                wrist_xy, main_pose, climb_rois,
+                wrist_xy, main_pose, safe_polygon, rail_band_px,
                 clm_cfg["wrist_conf_threshold"], clm_cfg["standing_y_margin"],
             )
-            exit_active, exit_diag = evaluate_roi_exit(center_xy, safe_roi)
+            exit_active, exit_diag = evaluate_roi_exit(center_xy, safe_polygon)
             fall_active, fall_diag = evaluate_fall(
-                center_xy, prev_center_xy,
+                raw_center_xy, prev_raw_center_xy,
                 now - prev_frame_time if prev_frame_time else 0.0,
                 fall_cfg["min_velocity_px_s"],
             )
@@ -224,60 +297,56 @@ def main() -> None:
             cry_condition = cry_raw and p is not None
             whimper_condition = whimper_raw and p is not None
 
-            active_risks: list[RiskSignal] = []
-            if suf_tracker.update(suf_active, now):
-                active_risks.append(RiskSignal(
-                    "suffocation_risk",
-                    p.confidence if p else 0.0,
-                    {"cause": cause, "duration_s": round(suf_tracker.elapsed(now), 1),
-                     "heuristic": "face_not_in_person", **suf_diag},
-                ))
-            if clm_tracker.update(clm_active, now):
-                active_risks.append(RiskSignal(
-                    "climbing_risk",
-                    p.confidence if p else 0.0,
-                    {"zone": "crib_rail", "duration_s": round(clm_tracker.elapsed(now), 1),
-                     "heuristic": "wrist_in_rail_and_standing", **clm_diag},
-                ))
-            if exit_tracker.update(exit_active, now):
-                active_risks.append(RiskSignal(
-                    "roi_exit_risk",
-                    p.confidence if p else 0.0,
-                    {"duration_s": round(exit_tracker.elapsed(now), 1),
-                     "heuristic": "person_center_outside_roi", **exit_diag},
-                ))
-            if fall_tracker.update(fall_active, now):
-                active_risks.append(RiskSignal(
-                    "fall_risk",
-                    p.confidence if p else 0.0,
-                    {"duration_s": round(fall_tracker.elapsed(now), 1),
-                     "heuristic": "rapid_y_descent", **fall_diag},
-                ))
-            if cry_tracker.update(cry_condition, now):
-                active_risks.append(RiskSignal(
-                    "cry_detected",
-                    cry_score,
-                    {"duration_s": round(cry_tracker.elapsed(now), 1),
-                     "heuristic": "yamnet_cry_and_person_present"},
-                ))
-            if whimper_tracker.update(whimper_condition, now):
-                active_risks.append(RiskSignal(
-                    "babble_detected",
-                    whimper_score,
-                    {"duration_s": round(whimper_tracker.elapsed(now), 1),
-                     "heuristic": "yamnet_babbling_and_person_present"},
-                ))
+            suf_triggered = suf_tracker.update(suf_active, now)
+            clm_triggered = clm_tracker.update(clm_active, now)
+            exit_triggered = exit_tracker.update(exit_active, now)
+            fall_triggered = fall_tracker.update(fall_active, now)
+            cry_triggered = cry_tracker.update(cry_condition, now)
+            whimper_triggered = whimper_tracker.update(whimper_condition, now)
 
-            for s in active_risks:
-                if now - last_event_ts.get(s.type, 0) >= cooldown_s:
-                    print(f"[EVENT] {s.type} conf={s.confidence:.2f} {s.metadata}")
-                    last_event_ts[s.type] = now
+            p_conf = p.confidence if p else 0.0
+            # disappeared는 person이 없어 검출 conf가 없음 → 고정값
+            suf_conf = p_conf if p is not None else 0.9
+            suf_heuristic = ("person_disappeared_in_roi" if cause == "disappeared"
+                             else "face_not_in_person")
+            event_inputs = [
+                ("suffocation_risk", suf_triggered, suf_conf,
+                 {"cause": cause, "heuristic": suf_heuristic, **suf_diag}),
+                ("climbing_risk", clm_triggered, p_conf,
+                 {"zone": "crib_rail", "heuristic": "wrist_in_rail_and_standing", **clm_diag}),
+                ("roi_exit_risk", exit_triggered, p_conf,
+                 {"heuristic": "person_center_outside_roi", **exit_diag}),
+                ("fall_risk", fall_triggered, p_conf,
+                 {"heuristic": "rapid_y_descent", **fall_diag}),
+                ("cry_detected", cry_triggered, cry_score,
+                 {"heuristic": "yamnet_cry_and_person_present"}),
+                ("babble_detected", whimper_triggered, whimper_score,
+                 {"heuristic": "yamnet_babbling_and_person_present"}),
+            ]
+
+            active_risks: list[RiskSignal] = []
+            events_to_publish: list[RiskSignal] = []
+            for ev_type, triggered, conf, meta in event_inputs:
+                sig = transition(ev_type, triggered, event_states, now, conf, meta)
+                if sig is not None:
+                    events_to_publish.append(sig)
+                if triggered:
+                    active_risks.append(RiskSignal(ev_type, conf, meta))
+
+            for s in events_to_publish:
+                phase = s.metadata.get("phase")
+                dur = s.metadata.get("duration_s", 0.0)
+                print(f"[EVENT] {s.type} phase={phase} conf={s.confidence:.2f} dur={dur:.1f}s")
+                payload = build_payload(s, device_serial)
+                if payload is not None:
+                    publisher.publish(payload)
 
             debug = {
                 "persons": len(persons),
                 "faces": len(faces),
                 "face_in_p": suf_diag.get("face_in_p", "-"),
-                "visible_kp": suf_diag.get("visible_keypoints", "-"),
+                "face_seen": f"{now - last_face_seen_time:.0f}s ago" if last_face_seen_time > 0 else "never",
+                "was_in_roi": person_was_in_roi,
                 "cause": cause or "-",
                 "suf_elapsed": f"{suf_tracker.elapsed(now):.1f}s",
                 "clm_elapsed": f"{clm_tracker.elapsed(now):.1f}s",
@@ -291,33 +360,28 @@ def main() -> None:
                 "babble_score": f"{whimper_score:.2f}" if audio_on else "off",
                 "babble_elapsed": f"{whimper_tracker.elapsed(now):.1f}s",
             }
-            prev_center_xy = center_xy
+            if p is not None:
+                person_was_in_roi = not exit_active
+            prev_raw_center_xy = raw_center_xy
             prev_frame_time = now
 
-            draw_overlay(frame, persons, faces, main_pose, safe_roi, climb_rois,
-                         active_risks, debug, suf_cfg["keypoint_conf_threshold"])
+            draw_overlay(frame, persons, faces, main_pose, safe_polygon,
+                         active_risks, debug, clm_cfg["wrist_conf_threshold"])
             cv2.imshow(window, frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
-            if key == ord("r"):
-                new_roi = select_roi_interactive(window, frame)
-                if new_roi is not None:
-                    safe_roi = clamp_roi(new_roi, w, h)
-                    print(f"[ROI] safe 업데이트: {safe_roi}")
-            if key == ord("c"):
-                if len(climb_rois) >= 4:
-                    print("[ROI] 최대 4개. x키로 전체 초기화 후 재추가 가능")
-                else:
-                    new_roi = select_roi_interactive(window, frame)
-                    if new_roi is not None:
-                        climb_rois.append(clamp_roi(new_roi, w, h))
-                        print(f"[ROI] climb_rail 추가 ({len(climb_rois)}개): {climb_rois[-1]}")
-            if key == ord("x"):
-                climb_rois.clear()
-                print("[ROI] climb_rail 전체 초기화")
+            elif key == ord("r"):
+                new_poly = select_polygon(cam, window)
+                if new_poly is not None:
+                    safe_polygon = new_poly
+                    clamped_once = False  # 다음 프레임에 재clamp
+                    if cfg["auto_roi"].get("detector", "manual") == "manual":
+                        save_polygon(ROI_PATH, safe_polygon)
+                        print(f"[ROI] 재정의·저장: {safe_polygon}")
     finally:
         audio.stop()
+        publisher.stop()
         cam.release()
         cv2.destroyAllWindows()
 
