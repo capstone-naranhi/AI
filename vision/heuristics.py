@@ -4,7 +4,7 @@
   1. suffocation_risk: face가 최근 보였는데 person 안에 face 없음 지속
   2. climbing_risk: pose wrist가 난간 ROI 안 + 서있음 자세 지속
   3. roi_exit_risk: person 중심이 안전 ROI 밖
-  4. fall_risk: person 중심 y가 빠르게 하강 (낙상)
+  4. fall_risk: person 중심 y가 짧은 윈도우 동안 크게 하강 (낙상)
 
 각 evaluate_* 는 순수 함수로 (판정, 진단) 반환.
 """
@@ -54,19 +54,23 @@ def evaluate_roi_exit(
 
 def evaluate_fall(
     center: Optional[tuple[float, float]],
-    prev_center: Optional[tuple[float, float]],
-    dt: float,
-    min_velocity_px_s: float,
+    past_center: Optional[tuple[float, float]],
+    min_drop_px: float,
 ) -> tuple[bool, dict]:
+    """짧은 윈도우(호출자가 관리) 동안의 순 하강 거리로 낙상 판정.
+
+    past_center는 약 window_s 전의 center. 단일 프레임 속도가 아니라
+    윈도우 누적 하강을 보므로 카메라 흔들림·검출 튐 같은 왕복성 노이즈가
+    상쇄되어 걸러진다. 진짜 낙상은 윈도우 동안 한 방향으로 크게 하강한다.
+    """
     diag: dict = {}
-    if center is None or prev_center is None or dt <= 0:
-        diag["block"] = "no_center_or_dt"
+    if center is None or past_center is None:
+        diag["block"] = "no_center"
         return False, diag
-    delta_y = center[1] - prev_center[1]  # 양수 = 아래로
-    velocity = delta_y / dt
-    diag["fall_velocity"] = round(velocity, 1)
-    if velocity < min_velocity_px_s:
-        diag["block"] = "velocity_too_low"
+    drop = center[1] - past_center[1]  # 양수 = 아래로
+    diag["fall_drop"] = round(drop, 1)
+    if drop < min_drop_px:
+        diag["block"] = "drop_too_small"
         return False, diag
     return True, diag
 
