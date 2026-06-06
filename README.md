@@ -23,7 +23,7 @@ python main.py
 ```
 
 - 창이 뜨고 웹캠 프레임에 person bbox(초록) + face bbox(노랑) + pose 뼈대(파랑) + safe ROI(연빨강) 폴리곤이 그려짐
-- 첫 실행 시 `yolov8n.pt`, `yolov8n-pose.pt`, `models/face_detection_yunet_2023mar.onnx`, YAMNet(~200MB) 자동 다운로드
+- 첫 실행 시 `yolo26n.pt`, `yolo26n-pose.pt`, `models/face_detection_yunet_2023mar.onnx`, YAMNet(~200MB) 자동 다운로드
 - 키
   - `q` 종료
   - `r` ROI(안전 영역) 재정의 — 네 꼭짓점 다시 클릭
@@ -43,11 +43,11 @@ python main.py
 
 ## 위험 판정 규칙
 
-### 영상 (YOLOv8n + pose)
+### 영상 (YOLO26n + pose)
 
 | 이벤트 | 조건 | 지속 시간 |
 |---|---|---|
-| `fall_risk` | person 중심 y 하강 속도 ≥ 200px/s (**raw bbox center**, EMA 미적용) | 0.3초 |
+| `fall_risk` | 1.5초 윈도우 내 순 하강 ≥ 80px (**raw bbox center**, EMA 미적용) | — |
 | `climbing_risk` | wrist가 ROI 변(난간)에 `rail_band_px` 이내 + 서있음 자세 | 2초 |
 | `suffocation_risk` | 아래 두 경로 중 하나 | 5초 |
 | `roi_exit_risk` | person 중심이 안전 ROI 밖 | 즉시(grace 0.5s) |
@@ -98,9 +98,9 @@ python main.py
 
 ## 진행 상황
 
-- [x] 1: 웹캠 + YOLOv8n 렌더 루프
+- [x] 1: 웹캠 + YOLO26n 렌더 루프
 - [x] 2: pose + ROI 기반 영상 휴리스틱 (suffocation/climbing/roi_exit)
 - [x] 3: fall_risk 분리 + YAMNet 울음·옹알이 감지 + duration_s 전송
 - [x] 4: 서버 연동 (MQTT)
 - [x] 5: 폴리곤 ROI 전환 + 질식 사라짐 추적 재설계 + 실물(인형) 검증
-- [ ] 6: 데모 준비 / Jetson 이식
+- [x] 6: 데모 준비 완료 / Jetson 이식 예정
