@@ -19,11 +19,12 @@ EVENT_TYPE_MAP: dict = {
 
 SUFFOCATION_CAUSE_MAP: dict = {
     "face_covered": "BLANKET_SUFFOCATION",
-    "disappeared": "BLANKET_SUFFOCATION",
+    "flipped": "PRONE_SUFFOCATION",
 }
 
 SEVERITY_MAP: dict = {
     "BLANKET_SUFFOCATION": "DANGER",
+    "PRONE_SUFFOCATION": "DANGER",
     "FALL": "DANGER",
     "CLIMBING": "CAUTION",
     "CRYING": "CAUTION",
