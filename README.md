@@ -47,16 +47,17 @@ python main.py
 
 | 이벤트 | 조건 | 지속 시간 |
 |---|---|---|
-| `fall_risk` | 1.5초 윈도우 내 순 하강 ≥ 80px (**raw bbox center**, EMA 미적용) | — |
-| `climbing_risk` | wrist가 ROI 변(난간)에 `rail_band_px` 이내 + 서있음 자세 | 2초 |
-| `suffocation_risk` | 아래 두 경로 중 하나 | 5초 |
-| `roi_exit_risk` | person 중심이 안전 ROI 밖 | 즉시(grace 0.5s) |
+| `fall_risk` | 1.5초 내 급격한 하강 감지 | — |
+| `climbing_risk` | 손목이 침대 난간 근처에 위치 + 서있음 자세 | 2초 |
+| `prone_suffocation_risk` | 몸 구조가 보이며 얼굴이 아래(매트 방향)를 향함 | 5초 |
+| `blanket_suffocation_risk` | 몸과 머리가 이불 등에 의해 완전히 가려짐 | 5초 |
+| `roi_exit_risk` | 영유아 중심이 안전 영역 밖으로 이동 | 즉시 (grace 0.5초) |
 
 **suffocation_risk 원인 분기** (검출기 신뢰도·색이 아니라 텍스처로 구분. ROI 안에 있었고 face가 최근 `face_memory_s` 보인 적 있을 때만 판정):
 - 공통 트리거: subject(pose 우선, 없으면 person) bbox에서 face가 안 보이는 상태가 지속.
 - 원인은 subject bbox 안쪽의 **회색조 엣지 밀도(edge_density, 색 무관)**로 가른다 — 엎드린 인형은 person으로 거의 안 잡히지만 pose로는 잘 잡히고, 팔다리·옷·얼굴 윤곽으로 엣지가 많다(실측 0.046~0.159). 천에 덮이면 매끈한 표면이라 엣지가 적다(0.012~0.042). 색과 무관하게 갈려 `flipped_edge_threshold`(0.044)로 분리.
 - `flipped`: 엎드림. subject 있음 + edge_density ≥ 임계(구조 있는 몸 노출) → 얼굴이 매트 쪽을 향함. 서버 이벤트 `PRONE_SUFFOCATION`(DANGER).
-- `face_covered`: edge_density < 임계(매끈한 천), 또는 subject가 아예 없음(몸·머리까지 완전히 파묻혀 검출 붕괴). 서버 이벤트 `BLANKET_SUFFOCATION`(DANGER).
+- `face_covered`: edge_density < 임계(천), 또는 subject가 아예 없음(몸·머리까지 완전히 파묻혀 검출 붕괴). 서버 이벤트 `BLANKET_SUFFOCATION`(DANGER).
 - 
 - **오탐 가드 1 — 정상 누움인데 face 미검출**: 카메라 각도상 YuNet이 얼굴을 못 잡아도, 천장을 보고 누우면(supine) pose가 얼굴 키포인트(코·눈·귀)를 높은 conf로 잡는다(실측 5/5, 0.93~0.98). 엎드리면(prone) 얼굴이 매트를 향해 죽는다(실측 1/5, nose 0.08). 그래서 `face_visible`을 **YuNet 검출 OR pose 얼굴 키포인트(`face_kp_conf_threshold` 이상이 `face_kp_min_visible`개 이상)**로 본다. 정상 누움은 `face_detected`로 빠져 위험 아님, 엎드림은 그대로 `flipped` 발송. 단 보조(OR) 신호로만 쓰므로 이불덮힘(키포인트도 안 보임)은 영향받지 않는다.
 - **오탐 가드 2 — 발만 보임(out_of_view)**: `flipped` 후보라도 subject bbox의 ROI 포함율(`roi_containment`)이 `out_of_view_roi_threshold`(0.72) 미만이면 인형이 카메라 각도 안에 제대로 안 잡힌 상태(발만 보임 등)다. 엎드림 정탐은 포함율이 높고(실측 88%) 이 케이스는 낮아(68%) 갈린다. 이때는 위험이 아니라 `out_of_view`로 처리해 `PRONE` 오발송을 막는다. `flipped` 분기에만 적용(face_covered는 별개 경로).
