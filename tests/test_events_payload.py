@@ -18,10 +18,10 @@ def test_suffocation_face_covered_maps_to_blanket():
     assert payload["severity"] == "DANGER"
 
 
-def test_suffocation_disappeared_maps_to_blanket():
-    sig = _signal("suffocation_risk", cause="disappeared")
+def test_suffocation_flipped_maps_to_prone():
+    sig = _signal("suffocation_risk", cause="flipped")
     payload = build_payload(sig, "DEV-001")
-    assert payload["eventType"] == "BLANKET_SUFFOCATION"
+    assert payload["eventType"] == "PRONE_SUFFOCATION"
     assert payload["severity"] == "DANGER"
 
 
