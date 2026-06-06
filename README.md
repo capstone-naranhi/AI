@@ -57,13 +57,11 @@ python main.py
 - 원인은 subject bbox 안쪽의 **회색조 엣지 밀도(edge_density, 색 무관)**로 가른다 — 엎드린 인형은 person으로 거의 안 잡히지만 pose로는 잘 잡히고, 팔다리·옷·얼굴 윤곽으로 엣지가 많다(실측 0.046~0.159). 천에 덮이면 매끈한 표면이라 엣지가 적다(0.012~0.042). 색과 무관하게 갈려 `flipped_edge_threshold`(0.044)로 분리.
 - `flipped`: 엎드림. subject 있음 + edge_density ≥ 임계(구조 있는 몸 노출) → 얼굴이 매트 쪽을 향함. 서버 이벤트 `PRONE_SUFFOCATION`(DANGER).
 - `face_covered`: edge_density < 임계(매끈한 천), 또는 subject가 아예 없음(몸·머리까지 완전히 파묻혀 검출 붕괴). 서버 이벤트 `BLANKET_SUFFOCATION`(DANGER).
+- 
 - **오탐 가드 1 — 정상 누움인데 face 미검출**: 카메라 각도상 YuNet이 얼굴을 못 잡아도, 천장을 보고 누우면(supine) pose가 얼굴 키포인트(코·눈·귀)를 높은 conf로 잡는다(실측 5/5, 0.93~0.98). 엎드리면(prone) 얼굴이 매트를 향해 죽는다(실측 1/5, nose 0.08). 그래서 `face_visible`을 **YuNet 검출 OR pose 얼굴 키포인트(`face_kp_conf_threshold` 이상이 `face_kp_min_visible`개 이상)**로 본다. 정상 누움은 `face_detected`로 빠져 위험 아님, 엎드림은 그대로 `flipped` 발송. 단 보조(OR) 신호로만 쓰므로 이불덮힘(키포인트도 안 보임)은 영향받지 않는다.
 - **오탐 가드 2 — 발만 보임(out_of_view)**: `flipped` 후보라도 subject bbox의 ROI 포함율(`roi_containment`)이 `out_of_view_roi_threshold`(0.72) 미만이면 인형이 카메라 각도 안에 제대로 안 잡힌 상태(발만 보임 등)다. 엎드림 정탐은 포함율이 높고(실측 88%) 이 케이스는 낮아(68%) 갈린다. 이때는 위험이 아니라 `out_of_view`로 처리해 `PRONE` 오발송을 막는다. `flipped` 분기에만 적용(face_covered는 별개 경로).
 - 한계 1: 주름·무늬가 심한 천은 엣지가 올라가 `flipped`로 튈 수 있음(5초 지속 트리거가 산발적 튐은 흡수).
 - 한계 2: **얼굴에만 이불을 덮으면** 몸·팔다리 텍스처가 살아 있어 edge가 높아 `flipped`로 오판함 → `BLANKET`이어야 할 게 `PRONE`으로 발송. 얼굴 위치를 모르는(얼굴 미검출) 단일 프레임 텍스처의 구조적 한계라 못 고침. 데모에선 이불을 상체까지 덮어 `face_covered`로 가게 연출해 회피.
-
-> 두 원인은 **서버 이벤트가 분리됨**: `flipped`→`PRONE_SUFFOCATION`, `face_covered`→`BLANKET_SUFFOCATION` (둘 다 DANGER).
-> **알려진 한계:** 보호자가 아기를 손으로 들어올려 ROI 밖으로 빼면 `roi_exit`가 경계를 못 잡아 `face_covered` 오탐이 날 수 있음. 안전 우선(false positive < false negative) 원칙으로 그대로 둠.
 
 ### 음성 (YAMNet AudioSet)
 
