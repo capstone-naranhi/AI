@@ -22,6 +22,7 @@ from vision.heuristics import (
     evaluate_suffocation,
     face_inside_person,
     main_person,
+    pose_face_visible,
 )
 from vision.person import PersonDetector
 from vision.pose import KP_NAMES, PoseDetector, match_pose_to_person
@@ -33,7 +34,7 @@ from events.mqtt_client import MqttPublisher
 from events.payload import build_payload
 from vision.quad_detector import ArucoQuadDetector, ContourQuadDetector
 from vision.manual_roi import load_polygon, save_polygon, select_polygon
-from vision.roi_geometry import average_quads
+from vision.roi_geometry import average_quads, point_in_polygon
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 ROI_PATH = Path(__file__).parent / "saved_roi.json"
@@ -71,6 +72,40 @@ def compute_wrist(pose, conf_threshold):
     return (cx, cy)
 
 
+def edge_density(frame, bbox):
+    """bbox 안쪽(테두리 배경 배제)의 회색조 Canny 엣지 비율 (0~1, 색 무관).
+
+    엎드림(팔다리·옷·얼굴 윤곽으로 구조 多)과 천 덮임(매끈한 표면)을 가르는
+    텍스처 특징. 측정상 prone 0.046~0.159 vs covered 0.012~0.042로 분리된다.
+    """
+    if bbox is None:
+        return 0.0
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    mx, my = int((x2 - x1) * 0.15), int((y2 - y1) * 0.15)  # 안쪽 70% 중앙
+    x1, y1 = max(0, x1 + mx), max(0, y1 + my)
+    x2, y2 = min(w, x2 - mx), min(h, y2 - my)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    return float(cv2.Canny(gray, 50, 150).mean()) / 255.0
+
+
+def roi_containment(bbox, polygon):
+    """subject bbox의 5x5 격자점 중 안전 ROI 폴리곤 안에 든 비율 (0~1).
+
+    bbox가 카메라 안전영역 안에 제대로 잡혔는지의 지표. 발만 걸친 채 ROI
+    밖으로 벗어나면 값이 낮아진다(엎드림 정탐 0.88 vs 발만 보임 0.68).
+    """
+    if bbox is None:
+        return 0.0
+    x1, y1, x2, y2 = bbox
+    gx = [x1 + (x2 - x1) * i / 4 for i in range(5)]
+    gy = [y1 + (y2 - y1) * j / 4 for j in range(5)]
+    inside = sum(1 for px in gx for py in gy if point_in_polygon((px, py), polygon))
+    return inside / 25.0
+
+
 def draw_pose(frame, pose, conf_threshold):
     if pose is None:
         return
@@ -86,7 +121,11 @@ def draw_pose(frame, pose, conf_threshold):
             cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), (255, 0, 0), 1)
 
 
-def draw_overlay(frame, persons, faces, main_pose, safe_polygon, active_risks, debug, kp_conf):
+POSE_DRAW_CONF = 0.5  # 이 신뢰도 미만으로 잡힌 사람은 pose 스켈레톤을 안 그림 (덮임 시 떨림 방지)
+
+
+def draw_overlay(frame, persons, faces, main_pose, safe_polygon, active_risks, debug, kp_conf,
+                 person_conf=1.0):
     pts = np.array(safe_polygon, np.int32)
     cv2.polylines(frame, [pts], True, (100, 100, 255), 2)
     cv2.putText(frame, "safe", (safe_polygon[0][0] + 4, safe_polygon[0][1] + 14),
@@ -101,16 +140,16 @@ def draw_overlay(frame, persons, faces, main_pose, safe_polygon, active_risks, d
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
         cv2.putText(frame, f"face {f.confidence:.2f}", (x1, max(0, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-    draw_pose(frame, main_pose, kp_conf)
+    if person_conf >= POSE_DRAW_CONF:
+        draw_pose(frame, main_pose, kp_conf)
     y = 18
     for k, v in debug.items():
         cv2.putText(frame, f"{k}: {v}", (10, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         y += 16
     for i, sig in enumerate(active_risks):
-        cause = sig.metadata.get("cause")
-        zone = sig.metadata.get("zone")
-        tag = cause or zone or ""
+        # suffocation은 cause(flipped/face_covered)를 구분해 표시
+        tag = sig.metadata.get("cause") or sig.metadata.get("zone") or ""
         label = f"[{sig.type}/{tag}]" if tag else f"[{sig.type}]"
         cv2.putText(frame, f"{label}", (10, y + 10 + i * 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -231,6 +270,10 @@ def main() -> None:
     fall_tracker = DurationTracker(0.0, 0.0)  # 윈도우가 시간 통합을 하므로 즉시 판정
 
     face_memory_s: float = suf_cfg.get("face_memory_s", 30.0)
+    flipped_edge_threshold: float = suf_cfg.get("flipped_edge_threshold", 0.044)
+    out_of_view_roi_threshold: float = suf_cfg.get("out_of_view_roi_threshold", 0.72)
+    face_kp_conf_threshold: float = suf_cfg.get("face_kp_conf_threshold", 0.5)
+    face_kp_min_visible: int = suf_cfg.get("face_kp_min_visible", 4)
 
     event_states: dict = {}
 
@@ -238,6 +281,8 @@ def main() -> None:
     person_was_in_roi: bool = False
     fall_window_s: float = fall_cfg["window_s"]
     fall_center_hist: deque = deque()  # (t, (cx, cy)) — 낙상 윈도우
+    last_climbing_time: float = 0.0    # climbing이 마지막으로 활성이던 시각
+    climb_ref_y = None                 # climbing 중이던 기준 높이 (고정)
 
     clamped_once = False
     try:
@@ -273,18 +318,34 @@ def main() -> None:
                 center_ema.reset()
                 wrist_ema.reset()
 
-            if p is not None and any(face_inside_person(f, p) for f in faces):
+            # YuNet face 검출 OR pose 얼굴 키포인트(각도상 face 미검출이지만 정상 누움 구제)
+            face_visible_now = (
+                (p is not None and any(face_inside_person(f, p) for f in faces))
+                or pose_face_visible(main_pose, face_kp_conf_threshold, face_kp_min_visible)
+            )
+            if face_visible_now:
                 last_face_seen_time = now
             face_recently_seen = (last_face_seen_time > 0
                                   and (now - last_face_seen_time) < face_memory_s)
 
+            # subject = pose(엎드림 인형도 잘 잡음) 우선, 없으면 person bbox
+            subject_bbox = (main_pose.bbox if main_pose is not None
+                            else p.bbox if p is not None else None)
+            suf_edge = edge_density(frame, subject_bbox)
+            suf_roiin = roi_containment(subject_bbox, safe_polygon)
             suf_active, cause, suf_diag = evaluate_suffocation(
-                p, faces, face_recently_seen, person_was_in_roi,
+                subject_bbox is not None, suf_edge, face_visible_now,
+                face_recently_seen, person_was_in_roi, flipped_edge_threshold,
+                suf_roiin, out_of_view_roi_threshold,
             )
             clm_active, clm_diag = evaluate_climbing(
                 wrist_xy, main_pose, safe_polygon, rail_band_px,
                 clm_cfg["wrist_conf_threshold"], clm_cfg["standing_y_margin"],
             )
+            if clm_active:
+                last_climbing_time = now
+                if raw_center_xy is not None:
+                    climb_ref_y = raw_center_xy[1]
             exit_active, exit_diag = evaluate_roi_exit(center_xy, safe_polygon)
 
             if raw_center_xy is not None:
@@ -297,6 +358,29 @@ def main() -> None:
             fall_active, fall_diag = evaluate_fall(
                 raw_center_xy, past_center_xy, fall_cfg["min_drop_px"],
             )
+            # climbing 직후 경로: 고정 기준 높이 대비 하강 (past_center 희석 회피)
+            in_climb_ctx = (last_climbing_time > 0
+                            and now - last_climbing_time < fall_cfg["climb_window_s"])
+            climb_drop = None
+            if (not fall_active and in_climb_ctx
+                    and raw_center_xy is not None and climb_ref_y is not None):
+                climb_drop = raw_center_xy[1] - climb_ref_y
+                if climb_drop >= fall_cfg["climb_drop_px"]:
+                    fall_active = True
+                    fall_diag.pop("block", None)
+                    fall_diag["climb_drop"] = round(climb_drop, 1)
+            # climbing 직후 경로 2: bbox 자세붕괴 (세로→가로=누움)
+            aspect = None
+            if p is not None:
+                _pw = p.bbox[2] - p.bbox[0]
+                _ph = p.bbox[3] - p.bbox[1]
+                if _ph > 0:
+                    aspect = _pw / _ph
+            if (not fall_active and in_climb_ctx and aspect is not None
+                    and aspect >= fall_cfg["climb_fall_aspect"]):
+                fall_active = True
+                fall_diag.pop("block", None)
+                fall_diag["climb_aspect"] = round(aspect, 2)
 
             cry_raw, cry_score, whimper_raw, whimper_score = (
                 audio.get_state() if audio_on else (False, 0.0, False, 0.0)
@@ -312,10 +396,10 @@ def main() -> None:
             whimper_triggered = whimper_tracker.update(whimper_condition, now)
 
             p_conf = p.confidence if p else 0.0
-            # disappeared는 person이 없어 검출 conf가 없음 → 고정값
+            # face_covered(몸 전체 덮임)는 person이 없어 검출 conf가 없음 → 고정값
             suf_conf = p_conf if p is not None else 0.9
-            suf_heuristic = ("person_disappeared_in_roi" if cause == "disappeared"
-                             else "face_not_in_person")
+            suf_heuristic = ("prone_high_edge_texture" if cause == "flipped"
+                             else "face_covered_by_blanket")
             event_inputs = [
                 ("suffocation_risk", suf_triggered, suf_conf,
                  {"cause": cause, "heuristic": suf_heuristic, **suf_diag}),
@@ -351,7 +435,8 @@ def main() -> None:
             debug = {
                 "persons": len(persons),
                 "faces": len(faces),
-                "face_in_p": suf_diag.get("face_in_p", "-"),
+                "edge": suf_diag.get("edge", "-"),
+                "roiin": suf_diag.get("roiin", "-"),
                 "face_seen": f"{now - last_face_seen_time:.0f}s ago" if last_face_seen_time > 0 else "never",
                 "was_in_roi": person_was_in_roi,
                 "cause": cause or "-",
@@ -370,7 +455,7 @@ def main() -> None:
                 person_was_in_roi = not exit_active
 
             draw_overlay(frame, persons, faces, main_pose, safe_polygon,
-                         active_risks, debug, clm_cfg["wrist_conf_threshold"])
+                         active_risks, debug, clm_cfg["wrist_conf_threshold"], p_conf)
             cv2.imshow(window, frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

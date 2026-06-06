@@ -2,10 +2,10 @@ camera:
   index: 2
 
 models:
-  person: yolov8n.pt
+  person: yolo26n.pt
   face:
     score_threshold: 0.6
-  pose: yolov8n-pose.pt
+  pose: yolo26n-pose.pt
 
 auto_roi:
   enabled: true
@@ -26,6 +26,10 @@ heuristics:
   suffocation:
     min_duration_s: 5.0
     face_memory_s: 30.0        # 최근 이 초 안에 face가 보인 적 있으면 소실 추적
+    flipped_edge_threshold: 0.044  # 얼굴 없을 때 subject 엣지밀도(회색조,색무관) ≥ 이 값=flipped(엎드림,구조 노출), 미만/소실=face_covered(매끈한 천)
+    out_of_view_roi_threshold: 0.72  # flipped 후보라도 subject bbox의 ROI 포함율 < 이 값이면 카메라 밖(발만 보임 등)=out_of_view(위험 아님). 엎드림 정탐 0.88 vs 엣지케이스 0.68 사이
+    face_kp_conf_threshold: 0.5  # pose 얼굴 키포인트(코·눈·귀)를 "보임"으로 칠 최소 conf
+    face_kp_min_visible: 4       # 얼굴 키포인트 이만큼 보이면 face_visible로 간주(YuNet 실패해도). 정상 누움 5/5 vs 엎드림 1/5 사이
   climbing:
     min_duration_s: 2.0
     wrist_conf_threshold: 0.5
@@ -33,8 +37,11 @@ heuristics:
   roi_exit:
     min_duration_s: 0.0        # 즉시 판정, grace로 튐 완화
   fall:
-    window_s: 0.3              # 이 시간 동안의 순 하강 거리를 본다 (단일 프레임 속도 X)
-    min_drop_px: 120           # 윈도우 내 하강이 이만큼(px) 이상이면 낙상
+    window_s: 1.5              # 이 시간 동안의 순 하강 거리를 본다 (단일 프레임 속도 X)
+    min_drop_px: 80            # 윈도우 내 하강이 이만큼(px) 이상이면 낙상 (실측 낙하 ~106px)
+    climb_window_s: 2.0        # climbing 활성 후 이 시간 동안 하강·자세붕괴 감시
+    climb_drop_px: 20          # climbing 기준 높이 대비 이만큼 하강하면 낙상 (경로 1)
+    climb_fall_aspect: 1.1     # climbing 직후 person bbox 가로/세로 비가 이 이상이면 누움=낙상 (경로 2)
 
 stability:
   grace_s: 0.5
