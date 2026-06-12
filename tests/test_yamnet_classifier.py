@@ -71,9 +71,9 @@ def test_get_state_initial():
 def test_whimper_above_threshold():
     clf = AudioClassifier(CFG)
     buf: list[float] = []
-    clf._window_mean(buf, 0.4)
-    clf._window_mean(buf, 0.4)
-    clf._update_state(0.0, clf._window_mean(buf, 0.4))
+    clf._window_mean(buf, 0.3)
+    clf._window_mean(buf, 0.3)
+    clf._update_state(0.0, clf._window_mean(buf, 0.3))
     _, _, whimper_active, whimper_score = clf.get_state()
     assert whimper_active is True
     assert whimper_score >= 0.25
