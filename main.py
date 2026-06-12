@@ -16,15 +16,23 @@ import yaml
 from vision.face import FaceDetector
 from vision.heuristics import (
     RiskSignal,
+    clearly_side_lying,
+    detect_suffocation,
     evaluate_climbing,
     evaluate_fall,
-    evaluate_roi_exit,
-    evaluate_suffocation,
     face_inside_person,
+    label_suffocation_cause,
     main_person,
+    memory_fresh,
+    pose_face_kp_count,
     pose_face_visible,
+    pose_torso_visible,
+    presence_sustained,
+    side_lying_features,
+    suffocation_latched,
 )
 from vision.person import PersonDetector
+from vision.head import HeadDetector
 from vision.pose import KP_NAMES, PoseDetector, match_pose_to_person
 from vision.smoothing import EMA
 from vision.tracker import DurationTracker
@@ -72,25 +80,6 @@ def compute_wrist(pose, conf_threshold):
     return (cx, cy)
 
 
-def edge_density(frame, bbox):
-    """bbox 안쪽(테두리 배경 배제)의 회색조 Canny 엣지 비율 (0~1, 색 무관).
-
-    엎드림(팔다리·옷·얼굴 윤곽으로 구조 多)과 천 덮임(매끈한 표면)을 가르는
-    텍스처 특징. 측정상 prone 0.046~0.159 vs covered 0.012~0.042로 분리된다.
-    """
-    if bbox is None:
-        return 0.0
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = (int(v) for v in bbox)
-    mx, my = int((x2 - x1) * 0.15), int((y2 - y1) * 0.15)  # 안쪽 70% 중앙
-    x1, y1 = max(0, x1 + mx), max(0, y1 + my)
-    x2, y2 = min(w, x2 - mx), min(h, y2 - my)
-    if x2 <= x1 or y2 <= y1:
-        return 0.0
-    gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    return float(cv2.Canny(gray, 50, 150).mean()) / 255.0
-
-
 def roi_containment(bbox, polygon):
     """subject bbox의 5x5 격자점 중 안전 ROI 폴리곤 안에 든 비율 (0~1).
 
@@ -104,6 +93,23 @@ def roi_containment(bbox, polygon):
     gy = [y1 + (y2 - y1) * j / 4 for j in range(5)]
     inside = sum(1 for px in gx for py in gy if point_in_polygon((px, py), polygon))
     return inside / 25.0
+
+
+def motion_level(prev_gray, gray, bbox):
+    """이전↔현재 프레임의 subject bbox 영역 회색조 절대차 평균 (0~1, 색 무관).
+
+    엎드림 정탐(정지=무반응)과 안전한 엎드림(배 시간·능동적 버둥거림)을 가르는
+    활력 신호. 움직이면 값이 오르고, 인형·천 덮인 무반응은 낮게 유지된다.
+    """
+    if prev_gray is None or bbox is None:
+        return 0.0
+    h, w = gray.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return float(cv2.absdiff(gray[y1:y2, x1:x2], prev_gray[y1:y2, x1:x2]).mean()) / 255.0
 
 
 def draw_pose(frame, pose, conf_threshold):
@@ -238,10 +244,16 @@ def main() -> None:
     person_det = PersonDetector(cfg["models"]["person"])
     face_det = FaceDetector(cfg["models"]["face"]["score_threshold"])
     pose_det = PoseDetector(cfg["models"]["pose"])
+    try:
+        head_weights = str(Path(__file__).parent / cfg["models"]["head"])
+        head_det = HeadDetector(head_weights,
+                                cfg["heuristics"]["suffocation"].get("head_conf_threshold", 0.25))
+    except Exception as e:
+        print(f"[head] 모델 로드 실패 → torso 폴백: {e}")
+        head_det = None
 
     suf_cfg = cfg["heuristics"]["suffocation"]
     clm_cfg = cfg["heuristics"]["climbing"]
-    exit_cfg = cfg["heuristics"]["roi_exit"]
     fall_cfg = cfg["heuristics"]["fall"]
     stab_cfg = cfg["stability"]
 
@@ -266,23 +278,38 @@ def main() -> None:
 
     suf_tracker = DurationTracker(suf_cfg["min_duration_s"], stab_cfg["grace_s"])
     clm_tracker = DurationTracker(clm_cfg["min_duration_s"], stab_cfg["grace_s"])
-    exit_tracker = DurationTracker(exit_cfg["min_duration_s"], stab_cfg["grace_s"])
     fall_tracker = DurationTracker(0.0, 0.0)  # 윈도우가 시간 통합을 하므로 즉시 판정
 
     face_memory_s: float = suf_cfg.get("face_memory_s", 30.0)
-    flipped_edge_threshold: float = suf_cfg.get("flipped_edge_threshold", 0.044)
+    roi_memory_s: float = suf_cfg.get("roi_memory_s", face_memory_s)
     out_of_view_roi_threshold: float = suf_cfg.get("out_of_view_roi_threshold", 0.72)
     face_kp_conf_threshold: float = suf_cfg.get("face_kp_conf_threshold", 0.5)
-    face_kp_min_visible: int = suf_cfg.get("face_kp_min_visible", 4)
+    face_kp_min_visible: int = suf_cfg.get("face_kp_min_visible", 2)
+    torso_kp_conf_threshold: float = suf_cfg.get("torso_kp_conf_threshold", 0.5)
+    torso_kp_min_visible: int = suf_cfg.get("torso_kp_min_visible", 2)
+    motion_threshold: float = suf_cfg.get("motion_threshold", 0.02)
+    head_memory_s: float = suf_cfg.get("head_memory_s", 2.0)
+    latch_max_s: float = suf_cfg.get("latch_max_s", 300.0)
+    presence_entry_s: float = suf_cfg.get("presence_entry_s", 10.0)
+    presence_gap_s: float = suf_cfg.get("presence_gap_s", 2.0)
+    side_cfg: dict = suf_cfg.get("side_lying_guard", {})
+    side_guard_enabled: bool = side_cfg.get("enabled", True)
+    side_spread_max: float = side_cfg.get("spread_max", 0.8)
+    side_min_conf: float = side_cfg.get("min_conf", 0.5)
 
     event_states: dict = {}
 
     last_face_seen_time: float = 0.0
-    person_was_in_roi: bool = False
+    last_in_roi_time: float = 0.0
+    last_head_seen_time: float = 0.0   # subject bbox 안에서 head를 마지막으로 본 시각
+    suf_latch_since: float = 0.0       # 질식 위험 활성 래치 시작 시각 (0=꺼짐)
+    roi_presence_since: float = 0.0    # subject가 ROI 안 연속 존재 시작 시각 (0=미존재)
+    last_roi_present_time: float = 0.0  # subject 중심을 ROI 안에서 마지막으로 본 시각
     fall_window_s: float = fall_cfg["window_s"]
     fall_center_hist: deque = deque()  # (t, (cx, cy)) — 낙상 윈도우
     last_climbing_time: float = 0.0    # climbing이 마지막으로 활성이던 시각
     climb_ref_y = None                 # climbing 중이던 기준 높이 (고정)
+    prev_gray = None                   # 직전 프레임 회색조 (활동량 계산용)
 
     clamped_once = False
     try:
@@ -296,6 +323,7 @@ def main() -> None:
                                 for x, y in safe_polygon]
                 clamped_once = True
             now = time()
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
             persons = person_det.detect(frame)
             faces = face_det.detect(frame)
@@ -318,26 +346,99 @@ def main() -> None:
                 center_ema.reset()
                 wrist_ema.reset()
 
-            # YuNet face 검출 OR pose 얼굴 키포인트(각도상 face 미검출이지만 정상 누움 구제)
-            face_visible_now = (
-                (p is not None and any(face_inside_person(f, p) for f in faces))
-                or pose_face_visible(main_pose, face_kp_conf_threshold, face_kp_min_visible)
+            # 얼굴이 보이면 안전 — 몸만 덮여 person 검출이 실패해도 ROI 안에 face가
+            # 잡히면 인정(얼굴 노출=안전). YuNet face OR pose 얼굴 키포인트.
+            face_in_roi = any(
+                point_in_polygon(((f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2),
+                                 safe_polygon)
+                for f in faces
             )
+            face_in_person = (p is not None
+                              and any(face_inside_person(f, p) for f in faces))
+            face_kp_visible = pose_face_visible(main_pose, face_kp_conf_threshold,
+                                                face_kp_min_visible)
+            face_visible_now = face_in_person or face_in_roi or face_kp_visible
+            # face_visible 발동 항 계측(OR 순서 첫 항) — prone 미탐 시 keypoint
+            # 환각이 범인인지 HUD에서 특정하기 위함 (face_kp_min_visible 조정은 측정 후)
+            face_src = ("yunet" if face_in_person else
+                        "roi" if face_in_roi else
+                        "kp" if face_kp_visible else "-")
             if face_visible_now:
                 last_face_seen_time = now
-            face_recently_seen = (last_face_seen_time > 0
-                                  and (now - last_face_seen_time) < face_memory_s)
+            face_recently_seen = memory_fresh(last_face_seen_time, now, face_memory_s)
+
+            # ROI 안에서 subject를 본 마지막 시각을 시간 메모리로 유지(face와 동일 패턴).
+            # boolean 래치(중심이 ROI 안인지 여부)는 덮는 도중 bbox 중심이 ROI 밖으로 밀리면
+            # False로 얼어붙어 face_covered를 영영 막으므로 시간 메모리로 대체.
+            if center_xy is not None and point_in_polygon(center_xy, safe_polygon):
+                last_in_roi_time = now
+                if roi_presence_since <= 0 or (now - last_roi_present_time) > presence_gap_s:
+                    roi_presence_since = now  # 미존재였거나 gap 초과 → 연속 구간 재시작
+                last_roi_present_time = now
+            person_was_in_roi = memory_fresh(last_in_roi_time, now, roi_memory_s)
+
+            # 진입 게이트(빈 방·인형 오탐 방지): (face 이력 AND roi 이력) OR
+            # ROI 연속 존재(입장부터 face를 안 보여준 엎드림 커버) OR 진행 중 래치
+            # (메모리 만료가 진행 중 위험을 끊어 END 오발행하는 결함 방지).
+            latched = suffocation_latched(suf_latch_since, now, face_visible_now, latch_max_s)
+            presence_ok = presence_sustained(roi_presence_since, last_roi_present_time,
+                                             now, presence_entry_s, presence_gap_s)
+            entry_ok = (face_recently_seen and person_was_in_roi) or presence_ok or latched
+            entry_src = ("face" if (face_recently_seen and person_was_in_roi) else
+                         "presence" if presence_ok else
+                         "latch" if latched else "-")
 
             # subject = pose(엎드림 인형도 잘 잡음) 우선, 없으면 person bbox
             subject_bbox = (main_pose.bbox if main_pose is not None
                             else p.bbox if p is not None else None)
-            suf_edge = edge_density(frame, subject_bbox)
+            suf_torso = pose_torso_visible(main_pose, torso_kp_conf_threshold, torso_kp_min_visible)
             suf_roiin = roi_containment(subject_bbox, safe_polygon)
-            suf_active, cause, suf_diag = evaluate_suffocation(
-                subject_bbox is not None, suf_edge, face_visible_now,
-                face_recently_seen, person_was_in_roi, flipped_edge_threshold,
+            suf_motion = motion_level(prev_gray, gray, subject_bbox)
+            prev_gray = gray
+            # head는 face 없을 때만(cause 판별 구간) 돌린다 — YOLOv5m CPU 비용 절약.
+            # 제3자(보호자 등) 머리로 cause가 오염되지 않게 subject bbox 안의 head만
+            # 인정하고, 프레임별 검출 깜빡임은 head_memory_s 시간 스무딩으로 흡수한다.
+            head_present = None
+            head_best_conf = None  # subject 안 최고 conf(임계 미달 포함) — HUD 계측용
+            head_any_conf = None   # 프레임 전체 최고 conf — bbox 게이트로 버려졌는지 판별용
+            if head_det is not None and not face_visible_now and subject_bbox is not None:
+                try:
+                    sx1, sy1, sx2, sy2 = subject_bbox
+                    # 입력은 전체 프레임 그대로 — subject 크롭 업스케일은 천 덮인
+                    # 머리까지 conf 0.1~0.3으로 끌어올려 prone(0.40)과의 분리를
+                    # 깨므로 철회(2026-06-13). 간헐 미검출은 head_memory_s로 완화.
+                    for h in head_det.detect(frame):
+                        if head_any_conf is None or h.confidence > head_any_conf:
+                            head_any_conf = h.confidence
+                        hcx = (h.bbox[0] + h.bbox[2]) / 2
+                        hcy = (h.bbox[1] + h.bbox[3]) / 2
+                        if sx1 <= hcx <= sx2 and sy1 <= hcy <= sy2:
+                            if head_best_conf is None or h.confidence > head_best_conf:
+                                head_best_conf = h.confidence
+                            if h.confidence >= head_det.conf_threshold:
+                                last_head_seen_time = now
+                    head_present = memory_fresh(last_head_seen_time, now, head_memory_s)
+                except Exception as e:
+                    print(f"[head] 검출 예외 → torso 폴백: {e}")
+                    head_present = None
+            suf_side = (side_guard_enabled
+                        and clearly_side_lying(main_pose, side_spread_max, side_min_conf))
+            suf_active, det_diag = detect_suffocation(face_visible_now, entry_ok)
+            cause, label_diag = label_suffocation_cause(
+                subject_bbox is not None, suf_torso, head_present, suf_side,
+                suf_motion, motion_threshold,
                 suf_roiin, out_of_view_roi_threshold,
             )
+            suf_diag = {**det_diag, **label_diag}
+            # 래치 갱신: 얼굴 재출현·상한 초과 → OFF, 위험 활성 → ON.
+            # side_lying/active_motion으로 일시 안전이어도 래치는 유지 — 얼굴이
+            # 안 보이는 타임라인이 이어지는 한, 다시 prone으로 구르면 재판정돼야 한다.
+            if face_visible_now:
+                suf_latch_since = 0.0
+            elif suf_latch_since > 0 and (now - suf_latch_since) >= latch_max_s:
+                suf_latch_since = 0.0
+            elif suf_active and suf_latch_since <= 0:
+                suf_latch_since = now
             clm_active, clm_diag = evaluate_climbing(
                 wrist_xy, main_pose, safe_polygon, rail_band_px,
                 clm_cfg["wrist_conf_threshold"], clm_cfg["standing_y_margin"],
@@ -346,7 +447,6 @@ def main() -> None:
                 last_climbing_time = now
                 if raw_center_xy is not None:
                     climb_ref_y = raw_center_xy[1]
-            exit_active, exit_diag = evaluate_roi_exit(center_xy, safe_polygon)
 
             if raw_center_xy is not None:
                 fall_center_hist.append((now, raw_center_xy))
@@ -390,7 +490,10 @@ def main() -> None:
 
             suf_triggered = suf_tracker.update(suf_active, now)
             clm_triggered = clm_tracker.update(clm_active, now)
-            exit_triggered = exit_tracker.update(exit_active, now)
+            # 같은 대상이 질식(DANGER)과 climbing(CAUTION)일 수는 없다 — 질식 우선.
+            # DANGER 활성 중 CAUTION만 거두는 것이라 안전 손실 없음. 역방향
+            # (climbing으로 질식 억제)은 FN 사고로 금지(2026-06-10).
+            clm_triggered = clm_triggered and not suf_triggered
             fall_triggered = fall_tracker.update(fall_active, now)
             cry_triggered = cry_tracker.update(cry_condition, now)
             whimper_triggered = whimper_tracker.update(whimper_condition, now)
@@ -398,21 +501,19 @@ def main() -> None:
             p_conf = p.confidence if p else 0.0
             # face_covered(몸 전체 덮임)는 person이 없어 검출 conf가 없음 → 고정값
             suf_conf = p_conf if p is not None else 0.9
-            suf_heuristic = ("prone_high_edge_texture" if cause == "flipped"
+            suf_heuristic = ("prone_torso_keypoints_visible" if cause == "flipped"
                              else "face_covered_by_blanket")
             event_inputs = [
                 ("suffocation_risk", suf_triggered, suf_conf,
                  {"cause": cause, "heuristic": suf_heuristic, **suf_diag}),
                 ("climbing_risk", clm_triggered, p_conf,
                  {"zone": "crib_rail", "heuristic": "wrist_in_rail_and_standing", **clm_diag}),
-                ("roi_exit_risk", exit_triggered, p_conf,
-                 {"heuristic": "person_center_outside_roi", **exit_diag}),
                 ("fall_risk", fall_triggered, p_conf,
                  {"heuristic": "rapid_y_descent", **fall_diag}),
                 ("cry_detected", cry_triggered, cry_score,
                  {"heuristic": "yamnet_cry_and_person_present"}),
                 ("babble_detected", whimper_triggered, whimper_score,
-                 {"heuristic": "yamnet_babbling_and_person_present"}),
+                 {"heuristic": "yamnet_babble_and_person_present"}),
             ]
 
             active_risks: list[RiskSignal] = []
@@ -435,25 +536,33 @@ def main() -> None:
             debug = {
                 "persons": len(persons),
                 "faces": len(faces),
-                "edge": suf_diag.get("edge", "-"),
-                "roiin": suf_diag.get("roiin", "-"),
-                "face_seen": f"{now - last_face_seen_time:.0f}s ago" if last_face_seen_time > 0 else "never",
-                "was_in_roi": person_was_in_roi,
-                "cause": cause or "-",
+                "cause": cause if suf_active else "-",
+                "face_src": face_src,
+                # 임계 이상 얼굴 키포인트 수 — kp 환각으로 위험이 취소될 때
+                # face_kp_min_visible을 어디까지 올려야 하는지 판단용
+                "face_kp": pose_face_kp_count(main_pose, face_kp_conf_threshold),
+                "entry": entry_src,
+                "flags": (",".join(k for k in ("out_of_view", "active_motion", "side_lying")
+                                   if label_diag.get(k)) or "-"),
                 "suf_elapsed": f"{suf_tracker.elapsed(now):.1f}s",
                 "clm_elapsed": f"{clm_tracker.elapsed(now):.1f}s",
-                "wrist_ema": tuple(round(x) for x in wrist_xy) if wrist_xy else "-",
-                "center_ema": tuple(round(x) for x in center_xy) if center_xy else "-",
-                "roi_exit": exit_active,
-                "fall_drop": fall_diag.get("fall_drop", "-"),
                 "cry_score": f"{cry_score:.2f}" if audio_on else "off",
                 "cry_elapsed": f"{cry_tracker.elapsed(now):.1f}s",
-                "babble_score": f"{whimper_score:.2f}" if audio_on else "off",
-                "babble_elapsed": f"{whimper_tracker.elapsed(now):.1f}s",
+                "motion": f"{suf_motion:.3f}",
+                "head": ("T" if head_present else "F") if head_present is not None else "-",
+                # head 미검출 원인 판별용: 임계(0.25) 미달 conf가 보이면 임계 하향 후보.
+                # head_c=- 인데 head_any에 값이 있으면 subject bbox 게이트가 버린 것
+                "head_c": f"{head_best_conf:.2f}" if head_best_conf is not None else "-",
+                "head_any": f"{head_any_conf:.2f}" if head_any_conf is not None else "-",
+                "torso": "T" if suf_torso else "F",
+                "roi_in": f"{suf_roiin:.2f}" if suf_roiin is not None else "-",
+                "side": (f"{max(side_lying_features(main_pose)[:2]):.2f}"
+                         if main_pose is not None else "-"),
+                "latch": f"{now - suf_latch_since:.0f}s" if suf_latch_since > 0 else "-",
+                # climbing 오발(누운 자세에서 발동) 튜닝용: standing_y_margin/rail_band_px 기준값
+                "clm_m": clm_diag.get("standing_margin", "-"),
+                "rail_d": clm_diag.get("rail_dist", "-"),
             }
-            if p is not None:
-                person_was_in_roi = not exit_active
-
             draw_overlay(frame, persons, faces, main_pose, safe_polygon,
                          active_risks, debug, clm_cfg["wrist_conf_threshold"], p_conf)
             cv2.imshow(window, frame)
