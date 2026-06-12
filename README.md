@@ -27,7 +27,7 @@ python main.py
 - 키
   - `q` 종료
   - `r` ROI(안전 영역) 재정의 — 네 꼭짓점 다시 클릭
-- HUD에 `cry_score` / `babble_score`와 각 휴리스틱 진단(diag) 표시 (audio off = 마이크 없음)
+- HUD에 핵심 상태(persons/faces/cause/suf·clm_elapsed/cry/motion/head/torso/roi_in) 표시 (audio off = 마이크 없음)
 
 ## ROI 설정 (안전 영역 지정)
 
@@ -47,22 +47,24 @@ python main.py
 
 | 이벤트 | 조건 | 지속 시간 |
 |---|---|---|
-| `fall_risk` | 1.5초 내 급격한 하강 감지 | — |
-| `climbing_risk` | 손목이 침대 난간 근처에 위치 + 서있음 자세 | 2초 |
-| `prone_suffocation_risk` | 몸 구조가 보이며 얼굴이 아래(매트 방향)를 향함 | 5초 |
-| `blanket_suffocation_risk` | 몸과 머리가 이불 등에 의해 완전히 가려짐 | 5초 |
-| `roi_exit_risk` | 영유아 중심이 안전 영역 밖으로 이동 | 즉시 (grace 0.5초) |
+| `fall_risk` | 1.5초 윈도우 내 순 하강 ≥ 80px (**raw bbox center**, EMA 미적용) | — |
+| `climbing_risk` | wrist가 ROI 변(난간)에 `rail_band_px` 이내 + 서있음 자세. `suffocation_risk` 활성 중엔 발행 안 함(상호 배타, 질식 우선) | 2초 |
+| `suffocation_risk` | 아래 두 경로 중 하나 | 5초 |
 
-**suffocation_risk 원인 분기** (검출기 신뢰도·색이 아니라 텍스처로 구분. ROI 안에 있었고 face가 최근 `face_memory_s` 보인 적 있을 때만 판정):
-- 공통 트리거: subject(pose 우선, 없으면 person) bbox에서 face가 안 보이는 상태가 지속.
-- 원인은 subject bbox 안쪽의 **회색조 엣지 밀도(edge_density, 색 무관)**로 가른다 — 엎드린 인형은 person으로 거의 안 잡히지만 pose로는 잘 잡히고, 팔다리·옷·얼굴 윤곽으로 엣지가 많다(실측 0.046~0.159). 천에 덮이면 매끈한 표면이라 엣지가 적다(0.012~0.042). 색과 무관하게 갈려 `flipped_edge_threshold`(0.044)로 분리.
-- `flipped`: 엎드림. subject 있음 + edge_density ≥ 임계(구조 있는 몸 노출) → 얼굴이 매트 쪽을 향함. 서버 이벤트 `PRONE_SUFFOCATION`(DANGER).
-- `face_covered`: edge_density < 임계(천), 또는 subject가 아예 없음(몸·머리까지 완전히 파묻혀 검출 붕괴). 서버 이벤트 `BLANKET_SUFFOCATION`(DANGER).
-- 
-- **오탐 가드 1 — 정상 누움인데 face 미검출**: 카메라 각도상 YuNet이 얼굴을 못 잡아도, 천장을 보고 누우면(supine) pose가 얼굴 키포인트(코·눈·귀)를 높은 conf로 잡는다(실측 5/5, 0.93~0.98). 엎드리면(prone) 얼굴이 매트를 향해 죽는다(실측 1/5, nose 0.08). 그래서 `face_visible`을 **YuNet 검출 OR pose 얼굴 키포인트(`face_kp_conf_threshold` 이상이 `face_kp_min_visible`개 이상)**로 본다. 정상 누움은 `face_detected`로 빠져 위험 아님, 엎드림은 그대로 `flipped` 발송. 단 보조(OR) 신호로만 쓰므로 이불덮힘(키포인트도 안 보임)은 영향받지 않는다.
-- **오탐 가드 2 — 발만 보임(out_of_view)**: `flipped` 후보라도 subject bbox의 ROI 포함율(`roi_containment`)이 `out_of_view_roi_threshold`(0.72) 미만이면 인형이 카메라 각도 안에 제대로 안 잡힌 상태(발만 보임 등)다. 엎드림 정탐은 포함율이 높고(실측 88%) 이 케이스는 낮아(68%) 갈린다. 이때는 위험이 아니라 `out_of_view`로 처리해 `PRONE` 오발송을 막는다. `flipped` 분기에만 적용(face_covered는 별개 경로).
-- 한계 1: 주름·무늬가 심한 천은 엣지가 올라가 `flipped`로 튈 수 있음(5초 지속 트리거가 산발적 튐은 흡수).
-- 한계 2: **얼굴에만 이불을 덮으면** 몸·팔다리 텍스처가 살아 있어 edge가 높아 `flipped`로 오판함 → `BLANKET`이어야 할 게 `PRONE`으로 발송. 얼굴 위치를 모르는(얼굴 미검출) 단일 프레임 텍스처의 구조적 한계라 못 고침. 데모에선 이불을 상체까지 덮어 `face_covered`로 가게 연출해 회피.
+**suffocation_risk — 2층 분리 구조** (감지와 원인 분류를 분리. 분류 신호는 감지를 차단하지 못한다 — 2026-06-10 카메라 검증에서 분류용 게이트(side 가드·climbing 베토)의 오탐이 그대로 질식 미탐으로 전이되는 구조적 결함이 확인돼 재설계):
+
+- **1층 감지**: `face 미가시 AND 진입 게이트`가 5초 지속되면 위험. 진입 게이트 통과 후 억제 조건은 face_visible 단 하나.
+  - `face_visible` = YuNet face가 person 안에 검출 OR ROI 안에 face 검출 OR pose 얼굴 키포인트(`face_kp_conf_threshold` 이상 `face_kp_min_visible`개 이상). 천장 보고 누우면(supine) 얼굴 키포인트가 살아 안전으로 빠지고, 엎드리면(prone) 죽어 위험으로 남는다(실측 supine 5/5 conf 0.93~0.98 vs prone 1/5 nose 0.08). HUD `face_src`(yunet/roi/kp)가 발동 항을 표시 — prone인데 face_visible이 켜지면 범인을 특정할 수 있다.
+  - 진입 게이트(빈 방·인형 오탐 방지) = (face가 최근 `face_memory_s` 안에 보임 AND subject가 ROI 안에 있었음) OR **subject 중심이 ROI 안에 `presence_entry_s`(10초) 연속 존재**(`presence_gap_s` 2초 이내 검출 깜빡임은 연속 취급) OR 진행 중 래치. presence 경로가 "입장부터 얼굴을 한 번도 안 보여준 엎드림" 미탐을 해소한다. HUD `entry`(face/presence/latch)가 통과 경로를 표시.
+- **2층 원인 라벨** (비차단 — 어떤 값이어도 감지를 끄지 못한다): cause는 항상 `flipped` 또는 `face_covered` 둘 중 하나(unknown 없음 — 서버 이벤트가 둘뿐이라 애매해도 둘 중 하나로 보내고 신뢰 맥락은 flags로 싣는다).
+  - subject(pose 우선, 없으면 person)가 아예 없음 → `face_covered` (완전 파묻힘 = 검출 붕괴).
+  - head 검출(crowdhuman) 보임 → `flipped`(뒤통수 노출=엎드림) / 안 보임 → `face_covered`(얼굴만 천 덮임 포함). head 검출기 미사용·예외 시 torso 폴백: 몸통 키포인트(어깨·엉덩이, 실측 prone 4/4 conf 0.95~0.99 vs 천 덮임 0/4)가 보이면 `flipped`, 소실이면 `face_covered`.
+  - `out_of_view`(ROI 포함율 < `out_of_view_roi_threshold`)·`active_motion`(활동량 ≥ `motion_threshold`)·`side_lying`(옆누움 기하, 가드 활성 시) — **flag(메타데이터)로만** 이벤트·HUD에 실린다. 이전 구조에선 이들이 위험을 차단하는 게이트였고, 그 오류가 그대로 질식 미탐이 됐다.
+- 이벤트 cause는 START 시점(5초가 차는 프레임)의 라벨로 고정된다(transition이 START에만 발행).
+
+> 두 원인은 **서버 이벤트가 분리됨**: `flipped`→`PRONE_SUFFOCATION`, `face_covered`→`BLANKET_SUFFOCATION` (둘 다 DANGER).
+
+
 
 ### 음성 (YAMNet AudioSet)
 
@@ -71,7 +73,7 @@ python main.py
 | `cry_detected` | Baby cry, Crying | 0.3 | 1초 |
 | `babble_detected` | Babbling | 0.25 | 2초 |
 
-- 두 이벤트 모두 **person이 화면에 있을 때만** 판정
+- **person이 화면에 있을 때만** 판정
 
 ### 서버 이벤트 매핑 (MQTT)
 
@@ -81,7 +83,6 @@ python main.py
 | `suffocation_risk` (cause=`face_covered`) | `BLANKET_SUFFOCATION` | DANGER |
 | `suffocation_risk` (cause=`flipped`) | `PRONE_SUFFOCATION` | DANGER |
 | `climbing_risk` | `CLIMBING` | CAUTION |
-| `roi_exit_risk` | `ROI_EXIT` | CAUTION |
 | `cry_detected` | `CRYING` | CAUTION |
 | `babble_detected` | `WHINING` | INFO |
 
@@ -99,7 +100,7 @@ python main.py
 
 - [x] 1: 웹캠 + YOLO26n 렌더 루프
 - [x] 2: pose + ROI 기반 영상 휴리스틱 (suffocation/climbing/roi_exit)
-- [x] 3: fall_risk 분리 + YAMNet 울음·옹알이 감지 + duration_s 전송
+- [x] 3: fall_risk 분리 + YAMNet 울음 감지 + duration_s 전송
 - [x] 4: 서버 연동 (MQTT)
 - [x] 5: 폴리곤 ROI 전환 + 질식 사라짐 추적 재설계 + 실물(인형) 검증
 - [x] 6: 데모 준비 완료 / Jetson 이식 예정
