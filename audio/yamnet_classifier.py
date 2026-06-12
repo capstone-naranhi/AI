@@ -11,7 +11,7 @@ class AudioClassifier:
         self._threshold: float = cfg["score_threshold"]
         self._whimper_threshold: float = cfg["whimper_score_threshold"]
         self._scores: list[float] = []           # audio callback thread only — no lock needed
-        self._whimper_scores: list[float] = []  # audio callback thread only — no lock needed
+        self._whimper_scores: list[float] = []
         self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
         self._lock = threading.Lock()
         self._cry_active: bool = False
@@ -21,7 +21,7 @@ class AudioClassifier:
         self._stream = None
         self._model = None
         self._cry_indices: list[int] = []      # populated by _load_model
-        self._whimper_indices: list[int] = []  # populated by _load_model
+        self._whimper_indices: list[int] = []
 
     def _window_mean(self, scores: list[float], score: float) -> float:
         scores.append(score)
@@ -56,12 +56,12 @@ class AudioClassifier:
                 ]
                 self._whimper_indices = [
                     int(row["index"]) for row in rows
-                    if "babbl" in row["display_name"].lower()
+                    if "babbling" in row["display_name"].lower()
                 ]
             if not self._cry_indices:
                 print("[Audio] cry/infant 클래스를 CSV에서 찾지 못함 — 모델 로드 실패")
                 return False
-            print(f"[Audio] YAMNet 로드 완료, cry {len(self._cry_indices)}개 / whimper {len(self._whimper_indices)}개")
+            print(f"[Audio] YAMNet 로드 완료, cry {len(self._cry_indices)}개, whimper {len(self._whimper_indices)}개")
             return True
         except Exception as e:
             print(f"[Audio] 모델 로드 실패: {e}")
@@ -73,10 +73,8 @@ class AudioClassifier:
             scores, _, _ = self._model(chunk)      # scores: (N_frames, 521)
             arr = scores.numpy()
             cry_score = float(np.max(arr[:, self._cry_indices]))
-            whimper_score = (
-                float(np.max(arr[:, self._whimper_indices]))
-                if self._whimper_indices else 0.0
-            )
+            whimper_score = (float(np.max(arr[:, self._whimper_indices]))
+                             if self._whimper_indices else 0.0)
         except Exception as e:
             print(f"[Audio] 추론 오류: {e}")
             return
